@@ -18,9 +18,13 @@ use solana_svm_timings::ExecuteTimings;
 use solana_transaction_context::{IndexOfAccount, TransactionContext};
 
 use crate::accounts_db::AccountsDb;
-use crate::compile::{compile_accounts_for_instruction, INSTRUCTION_PROGRAM_ID_INDEX};
+use crate::compile::{
+    compile_accounts_for_instruction, compile_instruction_for_transaction,
+    compile_transaction_account_keys, INSTRUCTION_PROGRAM_ID_INDEX,
+};
 use crate::error::SeashellError;
 use crate::scenario::Scenario;
+use crate::sysvar::SysvarInstructions;
 
 pub struct Config {
     pub memoize: bool,
@@ -365,6 +369,165 @@ impl Seashell {
         }
     }
 
+    /// Process multiple instructions atomically, as a single transaction.
+    ///
+    /// All instructions share one `TransactionContext`. If any instruction fails,
+    /// none of the changes are committed (even with `memoize` enabled).
+    pub fn process_instructions(&self, ixns: &[Instruction]) -> TransactionProcessingResult {
+        if ixns.is_empty() {
+            return TransactionProcessingResult {
+                total_compute_units_consumed: 0,
+                per_instruction_compute_units: vec![],
+                return_data: vec![],
+                error: None,
+                post_execution_accounts: vec![],
+            };
+        }
+
+        let transaction_account_keys = compile_transaction_account_keys(ixns);
+
+        let sysvar_instructions_id = solana_sdk_ids::sysvar::instructions::id();
+        let sysvar_instructions_account =
+            SysvarInstructions::construct_instructions_account_for_transaction(ixns);
+
+        let transaction_accounts: Vec<_> = transaction_account_keys
+            .iter()
+            .map(|pubkey| {
+                if *pubkey == sysvar_instructions_id {
+                    return (*pubkey, sysvar_instructions_account.clone());
+                }
+                // TODO: unlike process_instruction, this doesn't go through accounts_for_instruction
+                // so allow_uninitialized_accounts_local and RPC fallback are not honored here.
+                (*pubkey, self.accounts_db.account_must(pubkey))
+            })
+            .collect();
+
+        let sysvar_cache = self
+            .accounts_db
+            .sysvars_for_instruction(&transaction_accounts);
+
+        let mut transaction_context = TransactionContext::new(
+            transaction_accounts,
+            self.accounts_db.sysvars.rent(),
+            self.compute_budget.max_instruction_stack_depth,
+            self.compute_budget.max_instruction_trace_length,
+        );
+
+        let epoch_stake_callback = SeashellInvokeContextCallback { feature_set: &self.feature_set };
+        let runtime_features = self.feature_set.runtime_features();
+        let program_runtime_environments = ProgramRuntimeEnvironments::default();
+
+        let all_instruction_datas: Vec<&[u8]> = ixns.iter().map(|ix| ix.data.as_slice()).collect();
+        let mut programs = self.accounts_db.programs.clone();
+
+        let mut total_compute_units = 0u64;
+        let mut per_instruction_compute = Vec::with_capacity(ixns.len());
+
+        for (idx, ixn) in ixns.iter().enumerate() {
+            let (program_id_index, instruction_accounts) =
+                compile_instruction_for_transaction(ixn, &transaction_account_keys);
+
+            let mut dedup_map =
+                vec![u16::MAX; solana_transaction_context::MAX_ACCOUNTS_PER_TRANSACTION];
+            for (i, account) in instruction_accounts.iter().enumerate() {
+                let slot = dedup_map
+                    .get_mut(account.index_in_transaction as usize)
+                    .unwrap();
+                if *slot == u16::MAX {
+                    *slot = i as u16;
+                }
+            }
+
+            transaction_context
+                .configure_next_instruction(
+                    program_id_index,
+                    instruction_accounts,
+                    dedup_map,
+                    std::borrow::Cow::Borrowed(&ixn.data),
+                )
+                .expect("Failed to configure instruction");
+
+            let mut invoke_context = InvokeContext::new(
+                &mut transaction_context,
+                &mut programs,
+                EnvironmentConfig::new(
+                    Hash::default(),
+                    /* blockhash_lamports_per_signature */ 5000,
+                    &epoch_stake_callback,
+                    &runtime_features,
+                    &program_runtime_environments,
+                    &program_runtime_environments,
+                    &sysvar_cache,
+                ),
+                self.log_collector.clone(),
+                self.compute_budget.to_budget(),
+                self.compute_budget.to_cost(),
+            );
+
+            let mut compute_units_consumed = 0;
+
+            let result = if invoke_context.is_precompile(&ixn.program_id) {
+                invoke_context.process_precompile(
+                    &ixn.program_id,
+                    &ixn.data,
+                    all_instruction_datas.iter().copied(),
+                )
+            } else {
+                invoke_context.process_instruction(
+                    &mut compute_units_consumed,
+                    &mut ExecuteTimings::default(),
+                )
+            };
+
+            total_compute_units += compute_units_consumed;
+            per_instruction_compute.push(compute_units_consumed);
+
+            // Drop invoke_context to release &mut borrow on transaction_context.
+            drop(invoke_context);
+
+            if let Err(e) = result {
+                return TransactionProcessingResult {
+                    total_compute_units_consumed: total_compute_units,
+                    per_instruction_compute_units: per_instruction_compute,
+                    return_data: transaction_context.get_return_data().1.to_owned(),
+                    error: Some((idx, InstructionProcessingError::InstructionError(e))),
+                    post_execution_accounts: Vec::default(),
+                };
+            }
+        }
+
+        let return_data = transaction_context.get_return_data().1.to_owned();
+        let post_execution_accounts: Vec<(Pubkey, Account)> = transaction_account_keys
+            .iter()
+            .enumerate()
+            .map(|(idx, pubkey)| {
+                let accounts = transaction_context.accounts();
+                let account_ref = accounts
+                    .try_borrow(idx as IndexOfAccount)
+                    .expect("Failed to borrow TransactionAccounts");
+                let account = AccountSharedData::create(
+                    account_ref.lamports(),
+                    account_ref.data().to_vec(),
+                    *account_ref.owner(),
+                    account_ref.executable(),
+                    account_ref.rent_epoch(),
+                );
+                if self.config.memoize {
+                    self.set_account_from_account_shared_data(*pubkey, account.clone());
+                }
+                (*pubkey, account.into())
+            })
+            .collect();
+
+        TransactionProcessingResult {
+            total_compute_units_consumed: total_compute_units,
+            per_instruction_compute_units: per_instruction_compute,
+            return_data,
+            error: None,
+            post_execution_accounts,
+        }
+    }
+
     pub fn airdrop(&mut self, pubkey: Pubkey, amount: u64) {
         let mut account = self
             .accounts_db
@@ -399,6 +562,19 @@ pub struct InstructionProcessingResult {
     pub compute_units_consumed: u64,
     pub return_data: Vec<u8>,
     pub error: Option<InstructionProcessingError>,
+    pub post_execution_accounts: Vec<(Pubkey, Account)>,
+}
+
+pub struct TransactionProcessingResult {
+    /// Total compute units consumed across all instructions.
+    pub total_compute_units_consumed: u64,
+    /// Compute units consumed by each instruction individually.
+    pub per_instruction_compute_units: Vec<u64>,
+    /// Return data from the last successfully executed instruction.
+    pub return_data: Vec<u8>,
+    /// If an instruction failed: `(instruction_index, error)`. `None` if all succeeded.
+    pub error: Option<(usize, InstructionProcessingError)>,
+    /// Post-execution account states. Empty if any instruction failed (atomic rollback).
     pub post_execution_accounts: Vec<(Pubkey, Account)>,
 }
 
@@ -882,5 +1058,156 @@ mod tests {
             "Expected no return data, got: {:?}",
             result.return_data
         );
+    }
+
+    #[test]
+    fn test_process_instructions_native_transfer() {
+        crate::set_log();
+        let mut seashell = Seashell::new();
+
+        let alice = Pubkey::new_unique();
+        let bob = Pubkey::new_unique();
+        let carol = Pubkey::new_unique();
+        seashell.airdrop(alice, 1000);
+        seashell.accounts_db.set_account_mock(bob);
+        seashell.accounts_db.set_account_mock(carol);
+
+        // Two transfers in one atomic batch: alice->bob 600, alice->carol 400
+        let mut data1 = Vec::with_capacity(12);
+        data1.extend_from_slice(&2u32.to_le_bytes());
+        data1.extend_from_slice(&600u64.to_le_bytes());
+
+        let mut data2 = Vec::with_capacity(12);
+        data2.extend_from_slice(&2u32.to_le_bytes());
+        data2.extend_from_slice(&400u64.to_le_bytes());
+
+        let ix1 = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(bob, false)],
+            data: data1,
+        };
+        let ix2 = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(carol, false)],
+            data: data2,
+        };
+
+        let result = seashell.process_instructions(&[ix1, ix2]);
+        assert!(result.error.is_none(), "Expected no error, got: {:?}", result.error);
+        assert_eq!(result.per_instruction_compute_units.len(), 2);
+
+        let post_alice = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pk, _)| *pk == alice)
+            .unwrap()
+            .1
+            .clone();
+        let post_bob = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pk, _)| *pk == bob)
+            .unwrap()
+            .1
+            .clone();
+        let post_carol = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pk, _)| *pk == carol)
+            .unwrap()
+            .1
+            .clone();
+
+        assert_eq!(post_alice.lamports(), 0, "Alice should have 0 after sending 600+400");
+        assert_eq!(post_bob.lamports(), 600, "Bob should have 600");
+        assert_eq!(post_carol.lamports(), 400, "Carol should have 400");
+    }
+
+    #[test]
+    fn test_process_instructions_atomic_rollback() {
+        crate::set_log();
+        let mut seashell = Seashell::new_with_config(Config {
+            memoize: true,
+            allow_uninitialized_accounts_local: false,
+            allow_uninitialized_accounts_fetched: false,
+        });
+
+        let alice = Pubkey::new_unique();
+        let bob = Pubkey::new_unique();
+        seashell.airdrop(alice, 1000);
+        seashell.accounts_db.set_account_mock(bob);
+
+        // First instruction succeeds (transfer 600), second fails (transfer 600 again, but only 400 left)
+        let mut data1 = Vec::with_capacity(12);
+        data1.extend_from_slice(&2u32.to_le_bytes());
+        data1.extend_from_slice(&600u64.to_le_bytes());
+
+        let mut data2 = Vec::with_capacity(12);
+        data2.extend_from_slice(&2u32.to_le_bytes());
+        data2.extend_from_slice(&600u64.to_le_bytes());
+
+        let ix1 = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(bob, false)],
+            data: data1,
+        };
+        let ix2 = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(bob, false)],
+            data: data2,
+        };
+
+        let result = seashell.process_instructions(&[ix1, ix2]);
+        assert!(result.error.is_some(), "Second instruction should fail");
+        assert_eq!(result.error.as_ref().unwrap().0, 1, "Failure should be at index 1");
+
+        // With memoize=true, the accounts_db should NOT have been updated (atomic rollback).
+        let alice_account = seashell.account(&alice);
+        assert_eq!(
+            alice_account.lamports(),
+            1000,
+            "Alice should still have 1000 (no memoize on failure)"
+        );
+    }
+
+    #[test]
+    fn test_process_instructions_memoize() {
+        crate::set_log();
+        let mut seashell = Seashell::new_with_config(Config {
+            memoize: true,
+            allow_uninitialized_accounts_local: false,
+            allow_uninitialized_accounts_fetched: false,
+        });
+
+        let alice = Pubkey::new_unique();
+        let bob = Pubkey::new_unique();
+        seashell.airdrop(alice, 1000);
+        seashell.accounts_db.set_account_mock(bob);
+
+        let mut data = Vec::with_capacity(12);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&500u64.to_le_bytes());
+
+        let ix = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(bob, false)],
+            data,
+        };
+
+        let result = seashell.process_instructions(&[ix]);
+        assert!(result.error.is_none());
+
+        // With memoize, accounts_db should reflect the changes.
+        assert_eq!(seashell.account(&alice).lamports(), 500);
+        assert_eq!(seashell.account(&bob).lamports(), 500);
+    }
+
+    #[test]
+    fn test_process_instructions_empty() {
+        let seashell = Seashell::new();
+        let result = seashell.process_instructions(&[]);
+        assert!(result.error.is_none());
+        assert_eq!(result.total_compute_units_consumed, 0);
+        assert!(result.post_execution_accounts.is_empty());
     }
 }

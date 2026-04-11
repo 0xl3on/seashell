@@ -193,15 +193,20 @@ impl Seashell {
     /// Accounts from the scenario will override any existing accounts.
     /// When the scenario is dropped, it will be written back to the file.
     ///
-    /// If the RPC URL environment variable is set, missing accounts will be fetched from the RPC.
-    pub fn load_scenario(&mut self, scenario_name: &str) {
+    /// If `rpc_url` is provided, missing accounts will be fetched from that RPC endpoint.
+    /// If `rpc_url` is `None`, falls back to the `RPC_URL` environment variable.
+    pub fn load_scenario(&mut self, scenario_name: &str, rpc_url: Option<&str>) {
         let workspace_root = try_find_workspace_root().expect("Failed to locate workspace root");
         let scenario_path = workspace_root.join(format!("scenarios/{scenario_name}.json.gz"));
 
-        self.accounts_db.scenario = if let Ok(ref rpc_url) = std::env::var("RPC_URL") {
+        let resolved_rpc_url = rpc_url
+            .map(String::from)
+            .or_else(|| std::env::var("RPC_URL").ok());
+
+        self.accounts_db.scenario = if let Some(rpc_url) = resolved_rpc_url {
             Scenario::from_file_with_rpc(
                 scenario_path,
-                rpc_url.clone(),
+                rpc_url,
                 self.config.allow_uninitialized_accounts_fetched,
             )
         } else {
@@ -209,11 +214,17 @@ impl Seashell {
         };
     }
 
-    pub fn load_temporary_scenario(&mut self) {
-        let rpc_url = std::env::var("RPC_URL")
-            .expect("RPC_URL environment variable must be set for temporary scenarios");
+    /// Loads a temporary scenario that fetches accounts from RPC without persisting to disk.
+    ///
+    /// If `rpc_url` is provided, uses that endpoint.
+    /// If `rpc_url` is `None`, falls back to the `RPC_URL` environment variable.
+    pub fn load_temporary_scenario(&mut self, rpc_url: Option<&str>) {
+        let resolved_rpc_url = rpc_url
+            .map(String::from)
+            .or_else(|| std::env::var("RPC_URL").ok())
+            .expect("rpc_url must be provided or RPC_URL environment variable must be set");
         self.accounts_db.scenario =
-            Scenario::rpc_only(rpc_url, self.config.allow_uninitialized_accounts_fetched);
+            Scenario::rpc_only(resolved_rpc_url, self.config.allow_uninitialized_accounts_fetched);
     }
 
     pub fn process_instruction(&self, ixn: Instruction) -> InstructionProcessingResult {
@@ -233,7 +244,8 @@ impl Seashell {
 
         let instruction_accounts = compile_accounts_for_instruction(&ixn);
 
-        let mut dedup_map = vec![u16::MAX; solana_transaction_context::MAX_ACCOUNTS_PER_TRANSACTION];
+        let mut dedup_map =
+            vec![u16::MAX; solana_transaction_context::MAX_ACCOUNTS_PER_TRANSACTION];
         for (idx, account) in instruction_accounts.iter().enumerate() {
             let index_in_instruction = dedup_map
                 .get_mut(account.index_in_transaction as usize)
@@ -326,14 +338,12 @@ impl Seashell {
                     post_execution_accounts,
                 }
             }
-            Err(e) => {
-                InstructionProcessingResult {
-                    compute_units_consumed,
-                    return_data,
-                    error: Some(InstructionProcessingError::InstructionError(e)),
-                    post_execution_accounts: Vec::default(),
-                }
-            }
+            Err(e) => InstructionProcessingResult {
+                compute_units_consumed,
+                return_data,
+                error: Some(InstructionProcessingError::InstructionError(e)),
+                post_execution_accounts: Vec::default(),
+            },
         }
     }
 
@@ -354,11 +364,7 @@ impl Seashell {
         self.accounts_db.set_account(pubkey, account.into());
     }
 
-    pub fn set_account_from_account_shared_data(
-        &self,
-        pubkey: Pubkey,
-        account: AccountSharedData,
-    ) {
+    pub fn set_account_from_account_shared_data(&self, pubkey: Pubkey, account: AccountSharedData) {
         self.accounts_db.set_account(pubkey, account);
     }
 
@@ -739,9 +745,8 @@ mod tests {
         let pubkey1 = Pubkey::from_str_const("B91piBSfCBRs5rUxCMRdJEGv7tNEnFxweWcdQJHJoFpi");
         let pubkey2 = Pubkey::from_str_const("6gAnjderE13TGGFeqdPVQ438jp2FPVeyXAszxKu9y338");
 
-        // Load scenario (should create new file)
-        unsafe { std::env::set_var("RPC_URL", "https://api.mainnet-beta.solana.com") };
-        seashell.load_scenario("test_scenario");
+        // Load scenario with explicit RPC URL (no env var needed)
+        seashell.load_scenario("test_scenario", Some("https://api.mainnet-beta.solana.com"));
 
         // Verify accounts are currently accessible
         // Will panic if not set
@@ -751,16 +756,14 @@ mod tests {
         // Drop seashell to trigger scenario save
         drop(seashell);
 
-        // Create new seashell and load the saved scenario
+        // Create new seashell and load the saved scenario (no RPC needed, data is cached)
         let mut seashell2 = Seashell::new();
-        seashell2.load_scenario("test_scenario");
+        seashell2.load_scenario("test_scenario", None);
 
         // Verify accounts were persisted and loaded
         // Will panic if not set
         seashell2.account(&pubkey1);
         seashell2.account(&pubkey2);
-
-        unsafe { std::env::remove_var("RPC_URL") }
     }
 
     #[test]
@@ -772,15 +775,7 @@ mod tests {
         seashell.airdrop(pubkey, 1000);
         assert_eq!(seashell.account(&pubkey).lamports(), 1000);
 
-        use std::fs;
-
-        use tempfile::TempDir;
-        let temp_dir = TempDir::new().unwrap();
-        let scenarios_dir = temp_dir.path().join("scenarios");
-        fs::create_dir_all(&scenarios_dir).unwrap();
-        unsafe { std::env::set_var("CARGO_MANIFEST_DIR", temp_dir.path()) }
-
-        seashell.load_scenario("test_override");
+        seashell.load_scenario("test_override", None);
 
         let override_account =
             AccountSharedData::new(2000, 0, &solana_sdk_ids::system_program::id());
@@ -797,17 +792,8 @@ mod tests {
     fn test_missing_account_without_rpc() {
         let mut seashell = Seashell::new();
 
-        use std::fs;
-
-        use tempfile::TempDir;
-        let temp_dir = TempDir::new().unwrap();
-        let scenarios_dir = temp_dir.path().join("scenarios");
-        fs::create_dir_all(&scenarios_dir).unwrap();
-        unsafe { std::env::set_var("CARGO_MANIFEST_DIR", temp_dir.path()) }
-
-        // Ensure RPC_URL is not set
-        unsafe { std::env::remove_var("RPC_URL") }
-        seashell.load_scenario("test_no_rpc");
+        // Load scenario without RPC — no env var needed
+        seashell.load_scenario("test_no_rpc", None);
 
         let missing_pubkey = Pubkey::from_str_const("NoShot1111111111111111111111111111111111111");
         seashell.account(&missing_pubkey);
@@ -879,5 +865,4 @@ mod tests {
             result.return_data
         );
     }
-
 }

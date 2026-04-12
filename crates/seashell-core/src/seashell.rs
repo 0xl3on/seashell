@@ -396,9 +396,11 @@ impl Seashell {
                 if *pubkey == sysvar_instructions_id {
                     return (*pubkey, sysvar_instructions_account.clone());
                 }
-                // TODO: unlike process_instruction, this doesn't go through accounts_for_instruction
-                // so allow_uninitialized_accounts_local and RPC fallback are not honored here.
-                (*pubkey, self.accounts_db.account_must(pubkey))
+                (
+                    *pubkey,
+                    self.accounts_db
+                        .resolve_account(pubkey, self.config.allow_uninitialized_accounts_local),
+                )
             })
             .collect();
 
@@ -417,7 +419,6 @@ impl Seashell {
         let runtime_features = self.feature_set.runtime_features();
         let program_runtime_environments = ProgramRuntimeEnvironments::default();
 
-        let all_instruction_datas: Vec<&[u8]> = ixns.iter().map(|ix| ix.data.as_slice()).collect();
         let mut programs = self.accounts_db.programs.clone();
 
         let mut total_compute_units = 0u64;
@@ -467,11 +468,8 @@ impl Seashell {
             let mut compute_units_consumed = 0;
 
             let result = if invoke_context.is_precompile(&ixn.program_id) {
-                invoke_context.process_precompile(
-                    &ixn.program_id,
-                    &ixn.data,
-                    all_instruction_datas.iter().copied(),
-                )
+                let all_instruction_datas = ixns.iter().map(|ix| ix.data.as_slice());
+                invoke_context.process_precompile(&ixn.program_id, &ixn.data, all_instruction_datas)
             } else {
                 invoke_context.process_instruction(
                     &mut compute_units_consumed,
@@ -1065,62 +1063,81 @@ mod tests {
         crate::set_log();
         let mut seashell = Seashell::new();
 
-        let alice = Pubkey::new_unique();
-        let bob = Pubkey::new_unique();
-        let carol = Pubkey::new_unique();
-        seashell.airdrop(alice, 1000);
-        seashell.accounts_db.set_account_mock(bob);
-        seashell.accounts_db.set_account_mock(carol);
+        let from = solana_pubkey::Pubkey::new_unique();
+        let to_a = solana_pubkey::Pubkey::new_unique();
+        let to_b = solana_pubkey::Pubkey::new_unique();
+        seashell.airdrop(from, 1000);
+        seashell.accounts_db.set_account_mock(to_a);
+        seashell.accounts_db.set_account_mock(to_b);
+        println!("Airdropped 1000 lamports to {from}");
 
-        // Two transfers in one atomic batch: alice->bob 600, alice->carol 400
-        let mut data1 = Vec::with_capacity(12);
-        data1.extend_from_slice(&2u32.to_le_bytes());
-        data1.extend_from_slice(&600u64.to_le_bytes());
+        let mut data_a = Vec::with_capacity(12);
+        data_a.extend_from_slice(&2u32.to_le_bytes());
+        data_a.extend_from_slice(&600u64.to_le_bytes());
 
-        let mut data2 = Vec::with_capacity(12);
-        data2.extend_from_slice(&2u32.to_le_bytes());
-        data2.extend_from_slice(&400u64.to_le_bytes());
+        let mut data_b = Vec::with_capacity(12);
+        data_b.extend_from_slice(&2u32.to_le_bytes());
+        data_b.extend_from_slice(&400u64.to_le_bytes());
 
-        let ix1 = Instruction {
+        let ix_a = Instruction {
             program_id: solana_sdk_ids::system_program::id(),
-            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(bob, false)],
-            data: data1,
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to_a, false)],
+            data: data_a,
         };
-        let ix2 = Instruction {
+        let ix_b = Instruction {
             program_id: solana_sdk_ids::system_program::id(),
-            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(carol, false)],
-            data: data2,
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to_b, false)],
+            data: data_b,
         };
 
-        let result = seashell.process_instructions(&[ix1, ix2]);
+        let result = seashell.process_instructions(&[ix_a, ix_b]);
         assert!(result.error.is_none(), "Expected no error, got: {:?}", result.error);
         assert_eq!(result.per_instruction_compute_units.len(), 2);
 
-        let post_alice = result
+        let post_from = result
             .post_execution_accounts
             .iter()
-            .find(|(pk, _)| *pk == alice)
-            .unwrap()
-            .1
-            .clone();
-        let post_bob = result
-            .post_execution_accounts
-            .iter()
-            .find(|(pk, _)| *pk == bob)
-            .unwrap()
-            .1
-            .clone();
-        let post_carol = result
-            .post_execution_accounts
-            .iter()
-            .find(|(pk, _)| *pk == carol)
-            .unwrap()
-            .1
-            .clone();
+            .find(|(pubkey, _)| *pubkey == from)
+            .expect("Resulting account should exist")
+            .to_owned()
+            .1;
+        assert_eq!(
+            post_from.lamports(),
+            0,
+            "Expected from account to have 0 lamports after both transfers"
+        );
 
-        assert_eq!(post_alice.lamports(), 0, "Alice should have 0 after sending 600+400");
-        assert_eq!(post_bob.lamports(), 600, "Bob should have 600");
-        assert_eq!(post_carol.lamports(), 400, "Carol should have 400");
+        let post_to_a = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pubkey, _)| *pubkey == to_a)
+            .expect("Resulting account should exist")
+            .to_owned()
+            .1;
+        assert_eq!(
+            post_to_a.lamports(),
+            600,
+            "Expected to_a account to have 600 lamports after transfer"
+        );
+
+        let post_to_b = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pubkey, _)| *pubkey == to_b)
+            .expect("Resulting account should exist")
+            .to_owned()
+            .1;
+        assert_eq!(
+            post_to_b.lamports(),
+            400,
+            "Expected to_b account to have 400 lamports after transfer"
+        );
+
+        assert!(
+            result.return_data.is_empty(),
+            "Expected no return data, got: {:?}",
+            result.return_data
+        );
     }
 
     #[test]
@@ -1132,41 +1149,39 @@ mod tests {
             allow_uninitialized_accounts_fetched: false,
         });
 
-        let alice = Pubkey::new_unique();
-        let bob = Pubkey::new_unique();
-        seashell.airdrop(alice, 1000);
-        seashell.accounts_db.set_account_mock(bob);
+        let from = solana_pubkey::Pubkey::new_unique();
+        let to = solana_pubkey::Pubkey::new_unique();
+        seashell.airdrop(from, 1000);
+        seashell.accounts_db.set_account_mock(to);
 
-        // First instruction succeeds (transfer 600), second fails (transfer 600 again, but only 400 left)
-        let mut data1 = Vec::with_capacity(12);
-        data1.extend_from_slice(&2u32.to_le_bytes());
-        data1.extend_from_slice(&600u64.to_le_bytes());
+        let mut data_a = Vec::with_capacity(12);
+        data_a.extend_from_slice(&2u32.to_le_bytes());
+        data_a.extend_from_slice(&600u64.to_le_bytes());
 
-        let mut data2 = Vec::with_capacity(12);
-        data2.extend_from_slice(&2u32.to_le_bytes());
-        data2.extend_from_slice(&600u64.to_le_bytes());
+        let mut data_b = Vec::with_capacity(12);
+        data_b.extend_from_slice(&2u32.to_le_bytes());
+        data_b.extend_from_slice(&600u64.to_le_bytes());
 
-        let ix1 = Instruction {
+        let ix_a = Instruction {
             program_id: solana_sdk_ids::system_program::id(),
-            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(bob, false)],
-            data: data1,
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
+            data: data_a,
         };
-        let ix2 = Instruction {
+        let ix_b = Instruction {
             program_id: solana_sdk_ids::system_program::id(),
-            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(bob, false)],
-            data: data2,
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
+            data: data_b,
         };
 
-        let result = seashell.process_instructions(&[ix1, ix2]);
-        assert!(result.error.is_some(), "Second instruction should fail");
-        assert_eq!(result.error.as_ref().unwrap().0, 1, "Failure should be at index 1");
+        let result = seashell.process_instructions(&[ix_a, ix_b]);
+        assert!(result.error.is_some(), "Expected second instruction to fail");
+        assert_eq!(result.error.as_ref().unwrap().0, 1, "Expected failure index to be 1");
 
-        // With memoize=true, the accounts_db should NOT have been updated (atomic rollback).
-        let alice_account = seashell.account(&alice);
+        let post_from = seashell.account(&from);
         assert_eq!(
-            alice_account.lamports(),
+            post_from.lamports(),
             1000,
-            "Alice should still have 1000 (no memoize on failure)"
+            "Expected from account to still have 1000 lamports after atomic rollback"
         );
     }
 
@@ -1179,35 +1194,322 @@ mod tests {
             allow_uninitialized_accounts_fetched: false,
         });
 
-        let alice = Pubkey::new_unique();
-        let bob = Pubkey::new_unique();
-        seashell.airdrop(alice, 1000);
-        seashell.accounts_db.set_account_mock(bob);
+        let from = solana_pubkey::Pubkey::new_unique();
+        let to = solana_pubkey::Pubkey::new_unique();
+        seashell.airdrop(from, 1000);
+        seashell.accounts_db.set_account_mock(to);
 
         let mut data = Vec::with_capacity(12);
         data.extend_from_slice(&2u32.to_le_bytes());
         data.extend_from_slice(&500u64.to_le_bytes());
 
-        let ix = Instruction {
+        let ixn = Instruction {
             program_id: solana_sdk_ids::system_program::id(),
-            accounts: vec![AccountMeta::new(alice, true), AccountMeta::new(bob, false)],
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
             data,
         };
 
-        let result = seashell.process_instructions(&[ix]);
-        assert!(result.error.is_none());
+        let result = seashell.process_instructions(&[ixn]);
+        assert!(result.error.is_none(), "Expected no error, got: {:?}", result.error);
 
-        // With memoize, accounts_db should reflect the changes.
-        assert_eq!(seashell.account(&alice).lamports(), 500);
-        assert_eq!(seashell.account(&bob).lamports(), 500);
+        let post_from = seashell.account(&from);
+        assert_eq!(
+            post_from.lamports(),
+            500,
+            "Expected from account to have 500 lamports after transfer"
+        );
+
+        let post_to = seashell.account(&to);
+        assert_eq!(
+            post_to.lamports(),
+            500,
+            "Expected to account to have 500 lamports after transfer"
+        );
     }
 
     #[test]
     fn test_process_instructions_empty() {
         let seashell = Seashell::new();
         let result = seashell.process_instructions(&[]);
-        assert!(result.error.is_none());
+        assert!(result.error.is_none(), "Expected no error, got: {:?}", result.error);
         assert_eq!(result.total_compute_units_consumed, 0);
         assert!(result.post_execution_accounts.is_empty());
+    }
+
+    #[test]
+    fn test_process_instructions_allow_uninitialized_accounts() {
+        crate::set_log();
+        let mut seashell = Seashell::new_with_config(Config {
+            memoize: false,
+            allow_uninitialized_accounts_local: true,
+            allow_uninitialized_accounts_fetched: false,
+        });
+
+        let from = solana_pubkey::Pubkey::new_unique();
+        let to = solana_pubkey::Pubkey::new_unique();
+        seashell.airdrop(from, 1000);
+
+        let mut data = Vec::with_capacity(12);
+        data.extend_from_slice(&2u32.to_le_bytes());
+        data.extend_from_slice(&500u64.to_le_bytes());
+
+        let ixn = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
+            data,
+        };
+
+        let result = seashell.process_instructions(&[ixn]);
+        assert!(result.error.is_none(), "Expected no error, got: {:?}", result.error);
+
+        let post_to = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pubkey, _)| *pubkey == to)
+            .expect("Resulting account should exist")
+            .to_owned()
+            .1;
+        assert_eq!(
+            post_to.lamports(),
+            500,
+            "Expected to account to have 500 lamports after transfer"
+        );
+    }
+
+    #[test]
+    fn test_process_instructions_precompile() {
+        const MESSAGE_LENGTH: usize = 128;
+        crate::set_log();
+        let mut seashell = Seashell::new();
+
+        use rand::{thread_rng, Rng};
+        let mut rng = thread_rng();
+
+        let from = solana_pubkey::Pubkey::new_unique();
+        let to = solana_pubkey::Pubkey::new_unique();
+        seashell.airdrop(from, 1000);
+        seashell.accounts_db.set_account_mock(to);
+
+        let mut transfer_data = Vec::with_capacity(12);
+        transfer_data.extend_from_slice(&2u32.to_le_bytes());
+        transfer_data.extend_from_slice(&500u64.to_le_bytes());
+
+        let transfer_ixn = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(from, true), AccountMeta::new(to, false)],
+            data: transfer_data,
+        };
+
+        use ed25519_dalek::Signer;
+        let privkey = ed25519_dalek::Keypair::generate(&mut rng);
+        let message: Vec<u8> = (0..MESSAGE_LENGTH).map(|_| rng.gen_range(0, 255)).collect();
+        let signature = privkey.sign(&message).to_bytes();
+        let pubkey = privkey.public.to_bytes();
+        let ed25519_ixn = solana_ed25519_program::new_ed25519_instruction_with_signature(
+            &message, &signature, &pubkey,
+        );
+
+        let result = seashell.process_instructions(&[transfer_ixn, ed25519_ixn]);
+        assert!(result.error.is_none(), "Expected no error, got: {:?}", result.error);
+        assert_eq!(result.per_instruction_compute_units.len(), 2);
+        assert_eq!(
+            result.per_instruction_compute_units[1], 0,
+            "Expected ed25519 precompile to consume 0 compute units"
+        );
+
+        let post_from = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pubkey, _)| *pubkey == from)
+            .expect("Resulting account should exist")
+            .to_owned()
+            .1;
+        assert_eq!(
+            post_from.lamports(),
+            500,
+            "Expected from account to have 500 lamports after transfer"
+        );
+    }
+
+    #[test]
+    fn test_process_instructions_cpi_via_ata_program() {
+        crate::set_log();
+        let mut seashell = Seashell::new();
+
+        let payer = solana_pubkey::Pubkey::new_unique();
+        let mint = solana_pubkey::Pubkey::new_unique();
+        let mint_authority = solana_pubkey::Pubkey::new_unique();
+        let wallet = solana_pubkey::Pubkey::new_unique();
+
+        const MINT_LEN: u64 = 82;
+        const MINT_RENT: u64 = 1_461_600;
+        const TOKEN_ACCOUNT_LEN: usize = 165;
+
+        seashell.airdrop(payer, 10_000_000);
+        seashell.accounts_db.set_account_mock(wallet);
+        seashell
+            .accounts_db
+            .set_account(mint, AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id()));
+
+        let (ata, _) = Pubkey::find_program_address(
+            &[wallet.as_ref(), crate::spl::TOKEN_PROGRAM_ID.as_ref(), mint.as_ref()],
+            &crate::spl::ASSOCIATED_TOKEN_PROGRAM_ID,
+        );
+        seashell
+            .accounts_db
+            .set_account(ata, AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id()));
+
+        let mut create_mint_data = Vec::with_capacity(52);
+        create_mint_data.extend_from_slice(&0u32.to_le_bytes());
+        create_mint_data.extend_from_slice(&MINT_RENT.to_le_bytes());
+        create_mint_data.extend_from_slice(&MINT_LEN.to_le_bytes());
+        create_mint_data.extend_from_slice(&crate::spl::TOKEN_PROGRAM_ID.to_bytes());
+
+        let create_mint_ixn = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(mint, true)],
+            data: create_mint_data,
+        };
+
+        let mut init_mint_data = Vec::with_capacity(35);
+        init_mint_data.push(20);
+        init_mint_data.push(6);
+        init_mint_data.extend_from_slice(&mint_authority.to_bytes());
+        init_mint_data.push(0);
+
+        let init_mint_ixn = Instruction {
+            program_id: crate::spl::TOKEN_PROGRAM_ID,
+            accounts: vec![AccountMeta::new(mint, false)],
+            data: init_mint_data,
+        };
+
+        let create_ata_ixn = Instruction {
+            program_id: crate::spl::ASSOCIATED_TOKEN_PROGRAM_ID,
+            accounts: vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(ata, false),
+                AccountMeta::new_readonly(wallet, false),
+                AccountMeta::new_readonly(mint, false),
+                AccountMeta::new_readonly(solana_sdk_ids::system_program::id(), false),
+                AccountMeta::new_readonly(crate::spl::TOKEN_PROGRAM_ID, false),
+            ],
+            data: vec![],
+        };
+
+        let result =
+            seashell.process_instructions(&[create_mint_ixn, init_mint_ixn, create_ata_ixn]);
+        assert!(result.error.is_none(), "Expected no error, got: {:?}", result.error);
+        assert_eq!(result.per_instruction_compute_units.len(), 3);
+
+        let post_ata = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pubkey, _)| *pubkey == ata)
+            .expect("Resulting account should exist")
+            .to_owned()
+            .1;
+        assert_eq!(
+            post_ata.owner,
+            crate::spl::TOKEN_PROGRAM_ID,
+            "Expected ATA account to be owned by the token program"
+        );
+        assert_eq!(
+            post_ata.data.len(),
+            TOKEN_ACCOUNT_LEN,
+            "Expected ATA account to have token-account-sized data"
+        );
+        assert_eq!(
+            &post_ata.data[0..32],
+            &mint.to_bytes(),
+            "Expected ATA mint field to match mint pubkey"
+        );
+        assert_eq!(
+            &post_ata.data[32..64],
+            &wallet.to_bytes(),
+            "Expected ATA owner field to match wallet pubkey"
+        );
+    }
+
+    #[test]
+    fn test_process_instructions_create_and_init_mint() {
+        crate::set_log();
+        let mut seashell = Seashell::new();
+
+        let payer = solana_pubkey::Pubkey::new_unique();
+        let mint = solana_pubkey::Pubkey::new_unique();
+        let mint_authority = solana_pubkey::Pubkey::new_unique();
+
+        const MINT_LEN: u64 = 82;
+        const MINT_RENT: u64 = 1_461_600;
+
+        seashell.airdrop(payer, 10_000_000);
+        seashell
+            .accounts_db
+            .set_account(mint, AccountSharedData::new(0, 0, &solana_sdk_ids::system_program::id()));
+
+        let mut create_data = Vec::with_capacity(52);
+        create_data.extend_from_slice(&0u32.to_le_bytes());
+        create_data.extend_from_slice(&MINT_RENT.to_le_bytes());
+        create_data.extend_from_slice(&MINT_LEN.to_le_bytes());
+        create_data.extend_from_slice(&crate::spl::TOKEN_PROGRAM_ID.to_bytes());
+
+        let create_ixn = Instruction {
+            program_id: solana_sdk_ids::system_program::id(),
+            accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(mint, true)],
+            data: create_data,
+        };
+
+        let mut init_data = Vec::with_capacity(35);
+        init_data.push(20);
+        init_data.push(6);
+        init_data.extend_from_slice(&mint_authority.to_bytes());
+        init_data.push(0);
+
+        let init_ixn = Instruction {
+            program_id: crate::spl::TOKEN_PROGRAM_ID,
+            accounts: vec![AccountMeta::new(mint, false)],
+            data: init_data,
+        };
+
+        let result = seashell.process_instructions(&[create_ixn, init_ixn]);
+        assert!(result.error.is_none(), "Expected no error, got: {:?}", result.error);
+        assert_eq!(result.per_instruction_compute_units.len(), 2);
+
+        let post_mint = result
+            .post_execution_accounts
+            .iter()
+            .find(|(pubkey, _)| *pubkey == mint)
+            .expect("Resulting account should exist")
+            .to_owned()
+            .1;
+        assert_eq!(
+            post_mint.owner,
+            crate::spl::TOKEN_PROGRAM_ID,
+            "Expected mint account to be owned by the token program"
+        );
+        assert_eq!(post_mint.lamports, MINT_RENT, "Expected mint account to be funded with rent");
+        assert_eq!(
+            post_mint.data.len(),
+            MINT_LEN as usize,
+            "Expected mint account to have mint-sized data"
+        );
+        assert_eq!(
+            &post_mint.data[0..4],
+            &1u32.to_le_bytes(),
+            "Expected mint_authority COption tag to be Some"
+        );
+        assert_eq!(
+            &post_mint.data[4..36],
+            &mint_authority.to_bytes(),
+            "Expected mint_authority pubkey to match"
+        );
+        assert_eq!(&post_mint.data[36..44], &0u64.to_le_bytes(), "Expected mint supply to be 0");
+        assert_eq!(post_mint.data[44], 6, "Expected mint decimals to be 6");
+        assert_eq!(post_mint.data[45], 1, "Expected mint is_initialized to be true");
+        assert_eq!(
+            &post_mint.data[46..50],
+            &0u32.to_le_bytes(),
+            "Expected freeze_authority COption tag to be None"
+        );
     }
 }

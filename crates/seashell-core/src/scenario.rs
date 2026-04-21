@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use solana_account::{Account, AccountSharedData};
 use solana_pubkey::Pubkey;
+#[cfg(feature = "rpc-fetch")]
 use solana_rpc_client::rpc_client::RpcClient;
 
 /// Scenario manages account overrides with automatic persistence.
@@ -20,10 +21,12 @@ use solana_rpc_client::rpc_client::RpcClient;
 #[derive(Default)]
 pub struct Scenario {
     should_persist: Cell<bool>,
+    #[cfg_attr(not(feature = "rpc-fetch"), allow(dead_code))]
     pub(crate) allow_uninitialized_accounts: bool,
     dirty: Cell<bool>,
     data: Arc<RwLock<HashMap<Pubkey, AccountSharedData>>>,
     path: Option<PathBuf>,
+    #[cfg(feature = "rpc-fetch")]
     rpc_client: Option<RpcClient>,
 }
 
@@ -100,11 +103,13 @@ impl Scenario {
             dirty: Cell::new(false),
             data: Arc::new(RwLock::new(data)),
             path: Some(path),
+            #[cfg(feature = "rpc-fetch")]
             rpc_client: None,
         }
     }
 
     /// Load a scenario with RPC fallback enabled.
+    #[cfg(feature = "rpc-fetch")]
     pub fn from_file_with_rpc(
         path: PathBuf,
         rpc_url: String,
@@ -115,6 +120,7 @@ impl Scenario {
         scenario
     }
 
+    #[cfg(feature = "rpc-fetch")]
     pub fn rpc_only(rpc_url: String, allow_uninitialized_accounts: bool) -> Self {
         Scenario {
             should_persist: Cell::new(false),
@@ -128,10 +134,12 @@ impl Scenario {
 
     /// Fetch an account from RPC and store it in the scenario.
     /// Panics if RPC is not configured or if the RPC request fails.
+    #[cfg(feature = "rpc-fetch")]
     pub fn must_fetch_from_rpc(&self, pubkey: &Pubkey) -> AccountSharedData {
         self.try_fetch_from_rpc(pubkey).unwrap()
     }
 
+    #[cfg(feature = "rpc-fetch")]
     pub fn try_fetch_from_rpc(&self, pubkey: &Pubkey) -> Option<AccountSharedData> {
         log::debug!("Attempting to fetch account: {pubkey}");
         let rpc_client = self.rpc_client.as_ref().expect(
@@ -169,8 +177,17 @@ impl Scenario {
         self.data.write().insert(pubkey, account);
     }
 
+    /// Returns whether RPC fallback is configured. Always `false` when the
+    /// `rpc-fetch` feature is disabled.
     pub fn rpc_enabled(&self) -> bool {
-        self.rpc_client.is_some()
+        #[cfg(feature = "rpc-fetch")]
+        {
+            self.rpc_client.is_some()
+        }
+        #[cfg(not(feature = "rpc-fetch"))]
+        {
+            false
+        }
     }
 }
 

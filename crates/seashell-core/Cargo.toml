@@ -46,8 +46,8 @@ solana-precompile-error.workspace = true
 solana-program-runtime.workspace = true
 solana-pubkey = { workspace = true }
 solana-rent = { workspace = true }
-solana-rpc-client = { workspace = true }
-solana-rpc-client-api = { workspace = true }
+solana-rpc-client = { workspace = true, optional = true }
+solana-rpc-client-api = { workspace = true, optional = true }
 solana-sdk-ids = { workspace = true }
 solana-slot-hashes = { workspace = true }
 solana-stake-interface = { workspace = true }
@@ -68,3 +68,7 @@ solana-ed25519-program = { workspace = true }
 solana-secp256k1-program = { workspace = true, features = ["bincode"] }
 solana-secp256r1-program = { workspace = true }
 tempfile = { workspace = true }
+
+[features]
+default = ["rpc-fetch"]
+rpc-fetch = ["dep:solana-rpc-client", "dep:solana-rpc-client-api"]

@@ -58,9 +58,16 @@ impl AccountsDb {
 
     pub fn account_must(&self, pubkey: &Pubkey) -> AccountSharedData {
         self.account_maybe(pubkey).unwrap_or_else(|| {
-            self.scenario
-                .try_fetch_from_rpc(pubkey)
-                .expect("Account not found")
+            #[cfg(feature = "rpc-fetch")]
+            {
+                self.scenario
+                    .try_fetch_from_rpc(pubkey)
+                    .expect("Account not found")
+            }
+            #[cfg(not(feature = "rpc-fetch"))]
+            {
+                panic!("Account not found for {pubkey}")
+            }
         })
     }
 
@@ -89,6 +96,7 @@ impl AccountsDb {
             }
 
             // if account is not present in local cache, attempt to fetch from rpc
+            #[cfg(feature = "rpc-fetch")]
             if self.scenario.rpc_enabled() {
                 if let Some(account) = self.scenario.try_fetch_from_rpc(&pubkey) {
                     accounts.push((pubkey, account));

@@ -203,21 +203,39 @@ impl Seashell {
             .map(String::from)
             .or_else(|| std::env::var("RPC_URL").ok());
 
-        self.accounts_db.scenario = if let Some(rpc_url) = resolved_rpc_url {
-            Scenario::from_file_with_rpc(
+        #[cfg(feature = "rpc-fetch")]
+        {
+            self.accounts_db.scenario = if let Some(rpc_url) = resolved_rpc_url {
+                Scenario::from_file_with_rpc(
+                    scenario_path,
+                    rpc_url,
+                    self.config.allow_uninitialized_accounts_fetched,
+                )
+            } else {
+                Scenario::from_file(scenario_path, self.config.allow_uninitialized_accounts_fetched)
+            };
+        }
+
+        #[cfg(not(feature = "rpc-fetch"))]
+        {
+            assert!(
+                resolved_rpc_url.is_none(),
+                "an rpc_url was provided (or `RPC_URL` env var is set) but the `rpc-fetch` \
+                 feature is disabled. Enable the `rpc-fetch` feature to fetch missing accounts \
+                 from RPC."
+            );
+            self.accounts_db.scenario = Scenario::from_file(
                 scenario_path,
-                rpc_url,
                 self.config.allow_uninitialized_accounts_fetched,
-            )
-        } else {
-            Scenario::from_file(scenario_path, self.config.allow_uninitialized_accounts_fetched)
-        };
+            );
+        }
     }
 
     /// Loads a temporary scenario that fetches accounts from RPC without persisting to disk.
     ///
     /// If `rpc_url` is provided, uses that endpoint.
     /// If `rpc_url` is `None`, falls back to the `RPC_URL` environment variable.
+    #[cfg(feature = "rpc-fetch")]
     pub fn load_temporary_scenario(&mut self, rpc_url: Option<&str>) {
         let resolved_rpc_url = rpc_url
             .map(String::from)

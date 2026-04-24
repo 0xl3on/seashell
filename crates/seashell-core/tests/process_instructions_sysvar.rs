@@ -49,7 +49,7 @@ fn test_process_instructions_sysvar_instructions_current_index() {
     let program_id_base58 = program_id.to_string();
     assert!(
         logs.iter().any(|line| line.contains(&program_id_base58)),
-        "Expected logs to contain sysvar_ixns program_id (proving sysvar::instructions \
-         current index was updated to 1). Logs: {logs:#?}"
+        "Expected logs to contain sysvar_ixns program_id (proving sysvar::instructions current \
+         index was updated to 1). Logs: {logs:#?}"
     );
 }

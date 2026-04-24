@@ -131,6 +131,32 @@ impl Seashell {
             .map(|log_collector| log_collector.borrow().get_recorded_content().to_owned())
     }
 
+    /// Drop any logs accumulated so far, leaving the collector enabled and
+    /// empty. Useful when running multiple independent `process_instruction`
+    /// calls in the same test and wanting each call's `logs()` to reflect
+    /// only that call.
+    ///
+    /// `process_instruction` does NOT reset the log collector between calls,
+    /// so successive calls accumulate. Parsers that look for "the most
+    /// recent program data line" can silently read stale content from an
+    /// earlier call if the collector isn't cleared. Use this in that case:
+    ///
+    /// ```ignore
+    /// seashell.enable_log_collector();
+    /// seashell.process_instruction(ix_a);
+    /// let logs_a = seashell.logs();
+    /// seashell.clear_logs();            // <- reset before next call
+    /// seashell.process_instruction(ix_b);
+    /// let logs_b = seashell.logs();     // only ix_b's logs
+    /// ```
+    ///
+    /// No-op if the log collector isn't enabled.
+    pub fn clear_logs(&mut self) {
+        if self.log_collector.is_some() {
+            self.log_collector = Some(Rc::new(RefCell::new(LogCollector::default())));
+        }
+    }
+
     pub fn load_spl(&mut self) {
         crate::spl::load(self);
     }
